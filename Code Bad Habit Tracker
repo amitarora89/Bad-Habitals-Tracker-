@@ -1,0 +1,1223 @@
+import json
+import os
+from datetime import datetime, timedelta
+import calendar # For calendar operations
+
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.core.window import Window
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.spinner import Spinner
+from kivy.uix.scrollview import ScrollView
+from kivy.clock import Clock
+from kivy.logger import Logger
+from kivy.metrics import dp, sp # Use dp and sp for better UI scaling
+from kivy.utils import get_color_from_hex
+from kivy.graphics import Color, Rectangle
+from kivy.uix.popup import Popup
+
+# Set the background color for the window
+Window.clearcolor = (1, 1, 0.9, 1) # Light yellow background
+
+
+# Helper function to capitalize the first letter of a string
+def capitalize_first_letter(s):
+    if not s:
+        return ""
+    return s[0].upper() + s[1:]
+
+# Helper function to get today's date in %Y-%m-%d format
+def get_today_date_str():
+    return datetime.now().strftime('%Y-%m-%d')
+
+# Helper function to format date for display (DD-MM-YY)
+def get_display_date_from_str(date_str):
+    try:
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        return date_obj.strftime('%d-%m-%y')
+    except ValueError:
+        Logger.error(f"Date Formatting: Invalid date string: {date_str}")
+        return date_str # Return original if format is wrong
+
+# Helper function to get habit progress status for display (e.g., "4/7" for last 7 days)
+# UPDATED LOGIC: Counts distinct days the habit was completed within the last 7 calendar days.
+def get_habit_progress_status_for_display(habit):
+    completed_dates_raw = habit.get('completed_dates', [])
+    
+    # Convert all completed dates from strings to date objects for easier comparison
+    completed_date_objects = []
+    for date_str in completed_dates_raw:
+        try:
+            completed_date_objects.append(datetime.strptime(date_str, '%Y-%m-%d').date())
+        except ValueError:
+            Logger.warning(f"Progress Tracker: Invalid date format found for habit '{habit['name']}': {date_str}")
+            continue # Skip invalid date
+
+    today = datetime.now().date() # Get only date part (YYYY-MM-DD) for comparison
+    
+    # Calculate the number of *distinct* days the habit was completed within the last 7 calendar days.
+    # This aligns with the "X/7" format where X is the number of days the habit was done.
+    
+    distinct_completed_in_last_7_days = 0
+    # Iterate through the last 7 calendar days (today and previous 6 days)
+    for i in range(7):
+        check_date = today - timedelta(days=i)
+        # Check if this specific date is present in the habit's completed_date_objects
+        if check_date in completed_date_objects:
+            distinct_completed_in_last_7_days += 1
+
+    return f"{distinct_completed_in_last_7_days}/7"
+
+# UPDATED: New function to get total distinct completed count for a habit
+def get_habit_total_completed_count(habit):
+    completed_dates_raw = habit.get('completed_dates', [])
+    # Convert to set to count distinct dates, then get length
+    return len(set(completed_dates_raw))
+
+# Function to save all habit data to a JSON file (overwrite existing)
+def save_all_habits_to_file(all_habits_list):
+    current_app = App.get_running_app()
+    if not current_app:
+        Logger.error("HabitApp: App not running. Cannot save habits list.")
+        return
+
+    save_file_path = current_app.save_file_path
+    save_dir = os.path.dirname(save_file_path)
+
+    try:
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            Logger.info(f"HabitApp: Created directory: {save_dir}")
+    except OSError as e:
+        Logger.error(f"HabitApp: Error creating directory {save_dir}: {e}")
+        return
+
+    try:
+        with open(save_file_path, 'w') as f:
+            json.dump(all_habits_list, f, indent=4)
+        Logger.info(f"HabitApp: All habits saved successfully to {save_file_path}")
+    except Exception as e:
+        Logger.error(f"HabitApp: An error occurred while writing to {save_file_path}: {e}")
+
+# Function to add a new habit or update an existing one
+# MODIFIED: Habit uniqueness now based on name AND start_date
+def add_or_update_habit(habit_data):
+    all_habits = load_habits_from_file()
+
+    # Normalize habit name for comparison
+    normalized_new_habit_name = habit_data["name"].strip().lower()
+    new_habit_start_date = habit_data["start_date"] # Use start_date as part of unique key
+
+    found_index = -1
+    for i, habit in enumerate(all_habits):
+        # Check for both normalized name and start_date for uniqueness
+        if habit.get("name", "").strip().lower() == normalized_new_habit_name and \
+           habit.get("start_date") == new_habit_start_date:
+            found_index = i
+            break
+    
+    if found_index != -1: # Habit with this name and start_date exists, update it
+        existing_habit = all_habits[found_index]
+        
+        # Merge completed dates (ensure no duplicates and sorted)
+        existing_completed_dates = set(existing_habit.get('completed_dates', []))
+        new_completed_dates = set(habit_data.get('completed_dates', []))
+        
+        merged_completed_dates = sorted(list(existing_completed_dates.union(new_completed_dates)))
+        
+        existing_habit["name"] = capitalize_first_letter(habit_data["name"]) 
+        existing_habit["start_date"] = habit_data["start_date"] # Update start date (should be same for existing)
+        existing_habit["completed_dates"] = merged_completed_dates
+        Logger.info(f"HabitApp: Habit '{habit_data['name']}' with start date '{habit_data['start_date']}' updated.")
+    else: # New habit (or same name but different start_date), add it
+        # Ensure completed_dates is a list, and name is capitalized before adding
+        habit_data["name"] = capitalize_first_letter(habit_data["name"])
+        habit_data.setdefault("completed_dates", [])
+        all_habits.append(habit_data)
+        Logger.info(f"HabitApp: New habit '{habit_data['name']}' with start date '{habit_data['start_date']}' added.")
+    
+    save_all_habits_to_file(all_habits)
+
+
+# Function to load habit data from a JSON file
+def load_habits_from_file():
+    current_app = App.get_running_app()
+    if not current_app:
+        Logger.error("HabitApp: App not running. Cannot load habits.")
+        return []
+
+    save_file_path = current_app.save_file_path
+
+    if not os.path.exists(save_file_path):
+        Logger.info(f"HabitApp: Save file '{save_file_path}' does not exist. Returning empty list.")
+        return []
+
+    with open(save_file_path, 'r') as f:
+        try:
+            if os.fstat(f.fileno()).st_size == 0:
+                Logger.warning(f"HabitApp: File '{save_file_path}' is empty. Returning empty list.")
+                return []
+            data = json.load(f)
+            # Ensure completed_dates exists for older habits and capitalize names
+            for habit in data:
+                habit["name"] = capitalize_first_letter(habit.get("name", ""))
+                if "completed_dates" not in habit:
+                    habit["completed_dates"] = []
+                # Ensure start_date exists for older habits or new ones without it
+                if "start_date" not in habit:
+                    # If no start_date, derive from the earliest completed date or today
+                    if habit.get('completed_dates'):
+                        habit["start_date"] = sorted(habit['completed_dates'])[0]
+                    else:
+                        habit["start_date"] = get_today_date_str() # Default to today if no dates
+            return data
+        except json.JSONDecodeError:
+            Logger.warning(f"HabitApp: Could not decode JSON from {save_file_path}. File might be corrupted. Returning empty list.")
+            return []
+        except Exception as e:
+            Logger.error(f"HabitApp: An unexpected error occurred while reading {save_file_path}: {e}. Returning empty list.")
+            return []
+
+# Function to reset/delete all habits by removing the save file
+def reset_habits():
+    current_app = App.get_running_app()
+    if not current_app:
+        Logger.error("HabitApp: App not running. Cannot reset habits.")
+        return
+
+    save_file_path = current_app.save_file_path
+
+    try:
+        if os.path.exists(save_file_path):
+            os.remove(save_file_path)
+            Logger.info(f"HabitApp: All habits deleted by removing {save_file_path}.")
+        else:
+            Logger.info("HabitApp: No habit file to delete.")
+    except Exception as e:
+        Logger.error(f"HabitApp: Error deleting habit file {save_file_path}: {e}")
+    
+    if not os.path.exists(save_file_path):
+        Logger.info(f"HabitApp: Confirmed {save_file_path} is removed after reset.")
+
+# Check if a habit has been completed today
+def is_habit_completed_today(habit):
+    today_date = get_today_date_str()
+    return today_date in habit.get('completed_dates', [])
+
+
+# Main screen of the application
+class MainScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        layout = BoxLayout(orientation='vertical', padding=dp(40), spacing=dp(20))
+
+        title = Label(text='Habit Tracker App', font_size=sp(32), bold=True, color=(0, 0, 0, 1))
+        layout.add_widget(title)
+
+        # --- Section: Manage Habits (Add, View, Reset) ---
+        layout.add_widget(
+            Label(text='Manage Habits', font_size=sp(22), bold=True, color=(0,0,0,1), size_hint_y=None, height=dp(40))
+        )
+        section1_buttons = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(200), spacing=dp(10))
+
+        # Replaced "Add New Habit" with "Add Bad Habit"
+        add_bad_habit_btn = Button(text='Add Bad Habit', font_size=sp(24), bold=True, size_hint=(1, 0.33), background_color=(1, 0, 0, 1), color=(1, 1, 1, 1))
+        add_bad_habit_btn.bind(on_press=self.go_add_bad_habit) # New method
+        section1_buttons.add_widget(add_bad_habit_btn)
+
+        load_btn = Button(text='View All Habits', font_size=sp(24), bold=True, size_hint=(1, 0.33), background_color=(0, 0, 1, 1), color=(1, 1, 1, 1))
+        load_btn.bind(on_press=self.go_display_habits)
+        section1_buttons.add_widget(load_btn)
+
+        reset_btn = Button(text='Reset All Habits', font_size=sp(24), bold=True, size_hint=(1, 0.33), background_color=(0.5, 0.5, 0, 1), color=(1, 1, 1, 1))
+        reset_btn.bind(on_press=self.reset_all)
+        section1_buttons.add_widget(reset_btn)
+        layout.add_widget(section1_buttons)
+        # --- End Section 1 ---
+
+        # New "Analyse Habits" button
+        analyse_btn = Button(text='Analyse Habits', font_size=sp(24), bold=True, size_hint_y=None, height=dp(60), background_color=(0.8, 0.4, 0, 1), color=(1, 1, 1, 1))
+        analyse_btn.bind(on_press=self.go_analyse_habits)
+        layout.add_widget(analyse_btn)
+
+        # New 'Prayer' button
+        prayer_btn = Button(text='Prayer', font_size=sp(24), bold=True, size_hint_y=None, height=dp(60), background_color=get_color_from_hex('#4CAF50'), color=get_color_from_hex('#FFFFFF'))
+        prayer_btn.bind(on_press=self.go_to_prayer_screen)
+        layout.add_widget(prayer_btn)
+
+        layout.add_widget(Label(size_hint_y=None, height=dp(20))) # Spacer
+
+        self.add_widget(layout)
+
+    def on_pre_enter(self, *args):
+        pass
+
+    def go_add_bad_habit(self, instance): # New method for bad habits
+        if 'input' in self.manager.screen_names:
+            # Pass a flag or data to InputScreen to indicate it's for bad habits
+            self.manager.get_screen('input').set_habit_for_edit(None) # Reset for new habit
+            self.manager.get_screen('input').set_mode_bad_habit_selection(True)
+        self.manager.get_screen('input')._reset_error_states() # Ensure errors are reset
+        self.manager.current = 'input'
+
+    def go_display_habits(self, instance):
+        if 'habit_display' in self.manager.screen_names:
+            self.manager.get_screen('habit_display').refresh()
+        self.manager.current = 'habit_display'
+
+    def go_analyse_habits(self, instance):
+        if 'analysis_screen' in self.manager.screen_names:
+            self.manager.get_screen('analysis_screen').refresh_analysis()
+        self.manager.current = 'analysis_screen'
+
+    def go_to_prayer_screen(self, instance):
+        self.manager.current = 'prayer_screen'
+
+    def reset_all(self, instance):
+        reset_habits()
+        if 'habit_display' in self.manager.screen_names:
+            Clock.schedule_once(lambda dt: self.manager.get_screen('habit_display').refresh(), 0.1)
+
+
+# Screen for inputting new habits or editing existing ones
+class InputScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.editing_habit = None
+        self.selected_start_date = datetime.now().date()
+        self.is_bad_habit_mode = False # Flag to control UI for bad habits
+
+        # Define default colors for inputs
+        self.default_textinput_bg = (0.8, 0.8, 0.8, 1) # A light gray
+        
+        # Define the bad habit options
+        self.bad_habit_options = ['Cigarette', 'Wine', 'Masala', 'Harsh Words To Others', 'Not Thanks God Many Times']
+
+
+        layout = BoxLayout(orientation='vertical', padding=dp(40), spacing=dp(15))
+
+        self.title_label = Label(text='Add Bad Habit', font_size=sp(28), bold=True, color=(0, 0, 0, 1), size_hint_y=None, height=dp(50))
+        layout.add_widget(self.title_label)
+
+        # Habit Name Spinner (replaces TextInput)
+        name_layout = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(75))
+        self.habit_spinner = Spinner(
+            text='Select Bad Habit',
+            values=self.bad_habit_options,
+            font_size=sp(20),
+            size_hint_y=0.7,
+            background_color=(0.8, 0.8, 0.8, 1),
+            color=(0, 0, 0, 1)
+        )
+        self.name_error_label = Label(text='', color=get_color_from_hex('#B71C1C'), font_size=sp(14), size_hint_y=0.3, halign='left', valign='top', text_size=(Window.width - dp(80), None))
+        name_layout.add_widget(self.habit_spinner)
+        name_layout.add_widget(self.name_error_label)
+        layout.add_widget(name_layout)
+
+        # Date Picker for Habit Start Date (BUTTON)
+        self.start_date_button = Button(
+            text=f"Start Date: {self.selected_start_date.strftime('%Y-%m-%d')}",
+            font_size=sp(20),
+            size_hint_y=None, height=dp(50),
+            background_color=(0.6, 0.8, 1, 1), # Light blue button
+            color=(0,0,0,1)
+        )
+        self.start_date_button.bind(on_press=self.show_date_picker_popup)
+        layout.add_widget(self.start_date_button)
+
+
+        submit_btn = Button(text='Submit Habit', font_size=sp(20), size_hint_y=None, height=dp(60), background_color=(0, 0.5, 0, 1), color=(1, 1, 1, 1))
+        submit_btn.bind(on_press=self.submit_habit)
+        layout.add_widget(submit_btn)
+
+        back_btn = Button(text='Back to Main', font_size=sp(20), size_hint_y=None, height=dp(60), background_color=(0.5, 0, 0, 1), color=(1, 1, 1, 1))
+        back_btn.bind(on_press=self.go_back)
+        layout.add_widget(back_btn)
+
+        self.add_widget(layout)
+
+    def set_mode_bad_habit_selection(self, is_bad_habit_mode):
+        self.is_bad_habit_mode = is_bad_habit_mode
+        self.on_pre_enter() # Refresh UI based on mode
+
+    def set_habit_for_edit(self, habit_data):
+        self._reset_error_states() # Reset errors when setting for edit
+        self.editing_habit = habit_data # Store the full habit data
+
+        if habit_data:
+            self.title_label.text = 'Edit Bad Habit'
+            # For editing, set spinner text to current habit name
+            self.habit_spinner.text = habit_data.get('name', 'Select Bad Habit')
+            self.habit_spinner.disabled = True # Cannot change habit name during edit
+            
+            # Set selected start date for editing, default to today if not found
+            try:
+                self.selected_start_date = datetime.strptime(habit_data.get('start_date', get_today_date_str()), '%Y-%m-%d').date()
+            except ValueError:
+                self.selected_start_date = datetime.now().date()
+            self.start_date_button.text = f"Start Date: {self.selected_start_date.strftime('%Y-%m-%d')}"
+
+        else: # For adding new habit
+            self.title_label.text = 'Add Bad Habit'
+            self.habit_spinner.text = 'Select Bad Habit' # Reset spinner
+            self.habit_spinner.disabled = False
+            self.selected_start_date = datetime.now().date()
+            self.start_date_button.text = f"Start Date: {self.selected_start_date.strftime('%Y-%m-%d')}"
+
+    def _reset_error_states(self):
+        # Hide all error labels and reset input backgrounds
+        self.name_error_label.text = ''
+        self.name_error_label.height = dp(0) # Hide by setting height to 0
+        # Spinner doesn't have background_color for error, but we can set its text color if needed
+
+    def on_pre_enter(self, *args):
+        # Reset input fields and hide error messages
+        self._reset_error_states()
+        
+        if not self.editing_habit: # Only reset completely if not editing an existing habit
+            self.habit_spinner.text = 'Select Bad Habit'
+            self.selected_start_date = datetime.now().date()
+            self.start_date_button.text = f"Start Date: {self.selected_start_date.strftime('%Y-%m-%d')}"
+            self.habit_spinner.disabled = False # Enable for new selection
+        
+        # Update title based on whether we're editing or adding
+        if self.editing_habit:
+            self.title_label.text = 'Edit Bad Habit'
+        else:
+            self.title_label.text = 'Add Bad Habit'
+
+
+    # --- Date Picker Popup Logic ---
+    def show_date_picker_popup(self, instance):
+        popup_content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        
+        # Month Navigation
+        nav_layout = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(10))
+        # Initialize with currently selected date's month/year
+        self.current_month_picker = self.selected_start_date.month
+        self.current_year_picker = self.selected_start_date.year
+
+        prev_month_btn = Button(text='< Prev', size_hint_x=0.25, background_color=(0.3,0.3,0.3,1), color=(1,1,1,1))
+        prev_month_btn.bind(on_press=self.go_prev_month)
+        nav_layout.add_widget(prev_month_btn)
+
+        self.month_year_label_picker = Label(text=f'{calendar.month_name[self.current_month_picker]} {self.current_year_picker}',
+                                      font_size=sp(20), size_hint_x=0.5, color=(0,0,0,1))
+        nav_layout.add_widget(self.month_year_label_picker)
+
+        next_month_btn = Button(text='Next >', size_hint_x=0.25, background_color=(0.3,0.3,0.3,1), color=(1,1,1,1))
+        next_month_btn.bind(on_press=self.go_next_month)
+        nav_layout.add_widget(next_month_btn)
+        popup_content.add_widget(nav_layout)
+
+        # Day Names (Mon, Tue, Wed...)
+        day_names_layout = BoxLayout(size_hint_y=None, height=dp(30))
+        # Adjusting for Monday as first weekday for calendar.weekheader(2)
+        day_names = [calendar.day_abbr[i] for i in [0, 1, 2, 3, 4, 5, 6]] # Mon, Tue, ... Sun
+        for day_name in day_names: # calendar.weekheader(2).split() assumes Sunday as first
+            day_names_layout.add_widget(Label(text=day_name, bold=True, color=(0,0,0,1), font_size=sp(14)))
+        popup_content.add_widget(day_names_layout)
+
+        # Calendar Grid
+        self.calendar_grid_picker = GridLayout(cols=7, spacing=dp(2), size_hint_y=None, height=dp(250))
+        popup_content.add_widget(self.calendar_grid_picker)
+        
+        self.update_calendar_grid() # Populate the calendar grid
+        
+        # Close button for popup
+        close_btn = Button(text='Select & Close', size_hint_y=None, height=dp(50), background_color=(0.5,0.5,0.5,1), color=(1,1,1,1), font_size=sp(18))
+        popup_content.add_widget(close_btn)
+
+        self.date_picker_popup = Popup(title='Select Start Date', content=popup_content,
+                                 size_hint=(0.9, 0.8), auto_dismiss=False)
+        close_btn.bind(on_press=self.date_picker_popup.dismiss)
+        self.date_picker_popup.open()
+
+    def update_calendar_grid(self):
+        self.calendar_grid_picker.clear_widgets()
+        # Ensure Monday is the first day of the week
+        cal = calendar.Calendar(firstweekday=calendar.MONDAY) 
+
+        month_days = cal.monthdayscalendar(self.current_year_picker, self.current_month_picker)
+
+        for week in month_days:
+            for day in week:
+                if day == 0:
+                    self.calendar_grid_picker.add_widget(Label(text='', color=(0,0,0,1))) # Empty label for padding
+                else:
+                    day_btn = Button(text=str(day), size_hint_y=None, height=dp(35), font_size=sp(16))
+                    # Highlight the currently selected date
+                    if self.selected_start_date.day == day and self.selected_start_date.month == self.current_month_picker and self.selected_start_date.year == self.current_year_picker:
+                        day_btn.background_color = get_color_from_hex('#4CAF50') # Green for selected
+                        day_btn.color = (1,1,1,1)
+                    else:
+                        day_btn.background_color = (0.9,0.9,0.9,1) # Light grey for others
+                        day_btn.color = (0,0,0,1)
+                        
+                    day_btn.bind(on_press=self.select_date_from_calendar)
+                    day_btn.date_val = day # Store the day value in the button
+                    self.calendar_grid_picker.add_widget(day_btn)
+        
+        self.month_year_label_picker.text = f'{calendar.month_name[self.current_month_picker]} {self.current_year_picker}'
+
+
+    def go_prev_month(self, instance):
+        self.current_month_picker -= 1
+        if self.current_month_picker < 1:
+            self.current_month_picker = 12
+            self.current_year_picker -= 1
+        self.update_calendar_grid()
+
+    def go_next_month(self, instance):
+        self.current_month_picker += 1
+        if self.current_month_picker > 12:
+            self.current_month_picker = 1
+            self.current_year_picker += 1
+        self.update_calendar_grid()
+
+    def select_date_from_calendar(self, instance):
+        self.selected_start_date = datetime(self.current_year_picker, self.current_month_picker, instance.date_val).date()
+        self.start_date_button.text = f"Start Date: {self.selected_start_date.strftime('%Y-%m-%d')}"
+        self.date_picker_popup.dismiss()
+    # --- End Date Picker Popup Logic ---
+
+
+    def submit_habit(self, instance):
+        # Get selected habit from spinner
+        name = self.habit_spinner.text.strip()
+        start_date_str = self.selected_start_date.strftime('%Y-%m-%d')
+
+        self._reset_error_states() # Always reset errors at the beginning of submission
+
+        # Validation logic: Check if a habit is selected from the spinner
+        is_valid = True
+        if name == 'Select Bad Habit' or name not in self.bad_habit_options:
+            self.name_error_label.text = "कृपया एक बुरी आदत का चयन करें!"
+            # Dynamically set height based on content
+            self.name_error_label.height = self.name_error_label.texture_size[1] + dp(5) # Add a small padding
+            is_valid = False
+
+        if is_valid:
+            # Ensure the habit name is capitalized when saving
+            display_name = capitalize_first_letter(name)
+            
+            # When submitting, add start_date to completed_dates
+            # This makes the "start date" also a "completed date" for this specific entry.
+            initial_completed_dates = [start_date_str]
+
+            if self.editing_habit:
+                updated_habit = self.editing_habit.copy()
+                updated_habit["name"] = display_name # Update name in case of capitalization
+                # Remove description and period if they were present in old habit
+                if "description" in updated_habit:
+                    del updated_habit["description"]
+                if "period" in updated_habit:
+                    del updated_habit["period"]
+                updated_habit["start_date"] = start_date_str
+                # Merge existing completed dates with the new start_date if any
+                existing_completed = set(updated_habit.get('completed_dates', []))
+                merged_completed = sorted(list(existing_completed.union(set(initial_completed_dates))))
+                updated_habit["completed_dates"] = merged_completed
+
+                Logger.info(f"InputScreen: Updating habit '{display_name}' with start date '{start_date_str}'.")
+                add_or_update_habit(updated_habit)
+            else:
+                new_habit = {
+                    "name": display_name, # Save with capitalized name
+                    "start_date": start_date_str,
+                    "completed_dates": initial_completed_dates # Add start_date as first completed date
+                }
+                Logger.info(f"InputScreen: Adding new habit '{display_name}' with start date '{start_date_str}'.")
+                add_or_update_habit(new_habit)
+            
+            self.manager.current = 'habit_display'
+            if 'habit_display' in self.manager.screen_names:
+                self.manager.get_screen('habit_display').refresh()
+        else:
+            Logger.warning("InputScreen: Validation failed. Please fill all fields correctly.")
+
+
+    def go_back(self, instance):
+        self.manager.current = 'main'
+
+# Main display screen for habits
+class HabitDisplayScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root_layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(10))
+        self.add_widget(self.root_layout)
+
+        # Header for the list
+        header_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(50), padding=(dp(10), dp(10)), spacing=dp(5))
+        with header_layout.canvas.before:
+            Color(*get_color_from_hex('#42A5F5'))
+            self.header_rect = Rectangle(pos=header_layout.pos, size=header_layout.size)
+        header_layout.bind(pos=self._update_rect, size=self._update_rect)
+
+        # Headers adjusted for removed Period column and added Start Date
+        self.header_date_label = Label(text='Date Completed', font_size=sp(15), bold=True, color=get_color_from_hex('#FFFFFF'), size_hint_x=0.30, halign='left', valign='middle')
+        self.header_name_label = Label(text='Habit Name', font_size=sp(15), bold=True, color=get_color_from_hex('#FFFFFF'), size_hint_x=0.50, halign='left', valign='middle')
+        self.header_action_label = Label(text='Action', font_size=sp(15), bold=True, color=get_color_from_hex('#FFFFFF'), size_hint_x=0.20, halign='center', valign='middle')
+
+        self.header_date_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+        self.header_name_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+        self.header_action_label.bind(width=lambda i, w: setattr(i, 'text_size', (w, None)))
+
+        header_layout.add_widget(self.header_date_label)
+        header_layout.add_widget(self.header_name_label)
+        header_layout.add_widget(self.header_action_label)
+        self.root_layout.add_widget(header_layout)
+
+        self.scroll_view = ScrollView(size_hint=(1, 1))
+        self.root_layout.add_widget(self.scroll_view)
+
+        self.habits_list_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(5), padding=dp(5))
+        self.habits_list_layout.bind(minimum_height=self.habits_list_layout.setter('height'))
+        self.scroll_view.add_widget(self.habits_list_layout)
+
+        button_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(60), spacing=dp(10), padding=(0, dp(5), 0, 0))
+        self.root_layout.add_widget(button_layout)
+
+        self.main_page_btn = Button(text='Main Menu', font_size=sp(20), background_color=get_color_from_hex('#4CAF50'), color=get_color_from_hex('#FFFFFF'))
+        self.main_page_btn.bind(on_press=self.go_back_to_main)
+        button_layout.add_widget(self.main_page_btn)
+
+        self.reset_btn = Button(text='Reset All', font_size=sp(20), background_color=get_color_from_hex('#F44336'), color=get_color_from_hex('#FFFFFF'))
+        self.reset_btn.bind(on_press=self.reset_habits_and_refresh)
+        button_layout.add_widget(self.reset_btn)
+
+    def _update_rect(self, instance, value):
+        self.header_rect.pos = instance.pos
+        self.header_rect.size = instance.size
+
+    def _update_row_rects(self, instance, value):
+        if hasattr(instance, '_outer_rect'):
+            instance._outer_rect.pos = instance.pos
+            instance._outer_rect.size = instance.size
+        if hasattr(instance, '_inner_rect'):
+            instance._inner_rect.pos = (instance.pos[0] + dp(1), instance.pos[1] + dp(1))
+            instance._inner_rect.size = (instance.size[0] - dp(2), instance.size[1] - dp(2))
+
+    def on_pre_enter(self, *args):
+        self.refresh()
+
+    def refresh(self):
+        Logger.info("HabitDisplayScreen: Starting refresh.")
+        self.habits_list_layout.clear_widgets()
+        all_habits = load_habits_from_file()
+
+        # Prepare data for display: each completed date for each habit as a separate entry
+        display_entries = []
+        for habit in all_habits:
+            habit_name = capitalize_first_letter(habit['name'])
+            # If a habit has no completed dates but has a start_date, display it as a "Start" entry
+            if not habit.get('completed_dates') and habit.get('start_date'):
+                display_entries.append({
+                    'name': habit_name,
+                    'date': habit['start_date'], # Display start date if no completions
+                    'type': 'start_date_entry', # Indicate this is a start date entry
+                    'original_habit': habit # Pass the full habit object for actions
+                })
+            else:
+                for completed_date in sorted(habit.get('completed_dates', [])):
+                    display_entries.append({
+                        'name': habit_name,
+                        'date': completed_date,
+                        'type': 'completed_entry', # Indicate this is a completed date entry
+                        'original_habit': habit # Pass the full habit object for actions
+                    })
+
+        # Sort entries: first by date (newest first), then by habit name
+        display_entries.sort(key=lambda x: (x['date'], x['name']), reverse=True)
+
+
+        if not display_entries:
+            Logger.info("HabitDisplayScreen: No habits or completed dates found. Displaying 'No habits' message.")
+            no_habits_label = Label(text='No habits or completed entries found. Add From Main Menu.',
+                                    color=get_color_from_hex('#424242'), font_size=sp(14),
+                                    size_hint_y=None, height=dp(50))
+            self.habits_list_layout.add_widget(no_habits_label)
+        else:
+            for i, entry in enumerate(display_entries):
+                row_bg_color = get_color_from_hex('#FFFFFF') if i % 2 == 0 else get_color_from_hex('#F0F0F0')
+
+                entry_box = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(60), padding=(dp(5), dp(5)), spacing=dp(5))
+                with entry_box.canvas.before:
+                    Color(*get_color_from_hex('#B0B0B0'))
+                    entry_box._outer_rect = Rectangle(pos=entry_box.pos, size=entry_box.size)
+                    Color(*row_bg_color)
+                    entry_box._inner_rect = Rectangle(pos=entry_box.pos, size=entry_box.size)
+
+                entry_box.bind(pos=self._update_row_rects, size=self._update_row_rects)
+
+                # Date Label
+                date_label_text = get_display_date_from_str(entry['date'])
+                if entry['type'] == 'start_date_entry':
+                    date_label_text = f"Start: {date_label_text}" # Indicate it's a start date
+                
+                date_label = Label(text=date_label_text,
+                                         color=get_color_from_hex('#000000'), font_size=sp(14),
+                                         halign='left', valign='middle', size_hint_x=0.30)
+
+                # Habit Name Label
+                name_label = Label(text=entry['name'],
+                                   color=get_color_from_hex('#000000'), font_size=sp(14),
+                                   halign='left', valign='middle', size_hint_x=0.50)
+                
+                date_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+                name_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+
+                # Action button (for contextual menu)
+                action_button = Button(
+                    text='...',
+                    font_size=sp(18),
+                    size_hint_x=0.20,
+                    background_color=get_color_from_hex('#607D8B'),
+                    color=get_color_from_hex('#FFFFFF')
+                )
+                action_button.habit_data = entry['original_habit'] # Pass original habit data
+                action_button.entry_date = entry['date'] # Pass the specific date for this entry (could be start or completed)
+                action_button.entry_type = entry['type'] # Pass entry type
+                action_button.bind(on_press=self.show_habit_actions_popup)
+
+
+                entry_box.add_widget(date_label)
+                entry_box.add_widget(name_label)
+                entry_box.add_widget(action_button)
+
+                self.habits_list_layout.add_widget(entry_box)
+
+    def mark_habit_as_done(self, habit_data, popup_instance):
+        popup_instance.dismiss()
+        today_date_str = get_today_date_str()
+
+        # Check if the specific habit instance (name + start_date) has this date completed
+        if today_date_str not in habit_data.get('completed_dates', []):
+            habit_data.setdefault('completed_dates', []).append(today_date_str)
+            habit_data['completed_dates'].sort()
+            Logger.info(f"HabitDisplayScreen: Marked '{habit_data['name']}' (start: {habit_data['start_date']}) as done for {today_date_str}.")
+            
+            add_or_update_habit(habit_data) # Update based on name AND start_date
+            
+            self.refresh()
+        else:
+            Logger.info(f"HabitDisplayScreen: Habit '{habit_data['name']}' (start: {habit_data['start_date']}) already marked as done for {today_date_str}.")
+            self.show_info_popup("Already Done", f"'{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) is already marked as DONE for today.")
+
+
+    def show_habit_actions_popup(self, instance):
+        habit_to_act_on = instance.habit_data
+        entry_date = instance.entry_date # The date this specific row represents
+        entry_type = instance.entry_type
+
+        content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        content.add_widget(Label(text=f"Actions for '{capitalize_first_letter(habit_to_act_on['name'])}'",
+                                 font_size=sp(20), bold=True, halign='center', valign='middle',
+                                 size_hint_y=None, height=dp(40)))
+        
+        # Mark Done Button (Always refers to TODAY for THIS specific habit instance)
+        done_button = Button(text='Mark Done Today', font_size=sp(18), size_hint_y=None, height=dp(50), background_color=get_color_from_hex('#007BFF'), color=get_color_from_hex('#FFFFFF'))
+        if is_habit_completed_today(habit_to_act_on):
+            done_button.text = 'Done Today!'
+            done_button.background_color = get_color_from_hex('#28A745')
+            done_button.disabled = True
+        
+        # Edit Button - Only if this is an original habit entry (not a completed date entry)
+        # MODIFIED: Edit should now only edit the original "Start Date" habit entry.
+        edit_button = Button(text='Edit Habit', font_size=sp(18), size_hint_y=None, height=dp(50), background_color=get_color_from_hex('#FFC107'), color=get_color_from_hex('#000000'))
+        if entry_type == 'completed_entry': # Cannot edit a "completed_entry" instance directly
+             edit_button.disabled = True
+             edit_button.text = 'Edit Habit (N/A for completed date entry)'
+             edit_button.background_color = get_color_from_hex('#BBBBBB')
+
+
+        # Delete Button - This should delete the *entire habit instance* (name + start_date)
+        delete_entire_habit_btn = Button(text='Delete This Habit Entry', font_size=sp(18), size_hint_y=None, height=dp(50), background_color=get_color_from_hex('#DC3545'), color=get_color_from_hex('#FFFFFF'))
+        
+        content.add_widget(done_button)
+        content.add_widget(edit_button)
+        content.add_widget(delete_entire_habit_btn)
+        
+        # Option to remove a specific date's completion from THIS habit instance
+        if entry_type == 'completed_entry':
+            remove_date_completion_btn = Button(text=f'Remove Completion for {get_display_date_from_str(entry_date)}', font_size=sp(18), size_hint_y=None, height=dp(50), background_color=get_color_from_hex('#FFA07A'), color=get_color_from_hex('#000000'))
+            content.add_widget(remove_date_completion_btn)
+            remove_date_completion_btn.bind(on_press=lambda x: self._show_remove_completion_confirmation(habit_to_act_on, entry_date, popup))
+
+
+        # Mark for Specific Date Button (for THIS habit instance)
+        mark_specific_date_btn = Button(text='Mark For Specific Date', font_size=sp(18), size_hint_y=None, height=dp(50), background_color=get_color_from_hex('#FF9800'), color=get_color_from_hex('#FFFFFF'))
+        content.add_widget(mark_specific_date_btn)
+
+        
+        # Cancel Button
+        cancel_button = Button(text='Cancel', font_size=sp(18), size_hint_y=None, height=dp(50), background_color=get_color_from_hex('#6C757D'), color=(1, 1, 1, 1))
+        content.add_widget(cancel_button)
+
+        popup = Popup(title='Habit Options', content=content,
+                      size_hint=(0.8, 0.7), auto_dismiss=False)
+
+        done_button.bind(on_press=lambda x: self.mark_habit_as_done(habit_to_act_on, popup))
+        edit_button.bind(on_press=lambda x: self.go_to_edit_habit(habit_to_act_on, popup))
+        delete_entire_habit_btn.bind(on_press=lambda x: self._show_delete_confirmation_from_popup(habit_to_act_on, popup))
+        mark_specific_date_btn.bind(on_press=lambda x: self.show_mark_specific_date_popup(habit_to_act_on, popup))
+        cancel_button.bind(on_press=popup.dismiss)
+
+        popup.open()
+
+    def show_info_popup(self, title, message):
+        content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        content.add_widget(Label(text=message, font_size=sp(16), halign='center', valign='middle'))
+        close_button = Button(text='OK', size_hint=(1, None), height=dp(40), font_size=sp(18))
+        content.add_widget(close_button)
+        
+        info_popup = Popup(title=title, content=content,
+                            size_hint=(0.7, 0.3), auto_dismiss=False)
+        close_button.bind(on_press=info_popup.dismiss)
+        info_popup.open()
+
+    # Confirmation for removing a specific date's completion
+    def _show_remove_completion_confirmation(self, habit_data, date_to_remove, parent_popup_instance):
+        parent_popup_instance.dismiss()
+        content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        content.add_widget(Label(text=f"Remove '{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) completion for {get_display_date_from_str(date_to_remove)}?",
+                                 font_size=sp(18), halign='center', valign='middle', size_hint_y=None, height=dp(60)))
+        
+        button_layout = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
+        yes_button = Button(text='Yes', font_size=sp(18), background_color=get_color_from_hex('#28A745'), color=get_color_from_hex('#FFFFFF'))
+        no_button = Button(text='No', font_size=sp(18), background_color=get_color_from_hex('#DC3545'), color=get_color_from_hex('#FFFFFF'))
+        
+        button_layout.add_widget(yes_button)
+        button_layout.add_widget(no_button)
+        content.add_widget(button_layout)
+
+        confirm_popup = Popup(title='Confirm Removal', content=content,
+                      size_hint=(0.8, 0.4), auto_dismiss=False)
+        
+        yes_button.bind(on_press=lambda x: self._confirm_remove_completion(habit_data, date_to_remove, confirm_popup))
+        no_button.bind(on_press=confirm_popup.dismiss)
+        confirm_popup.open()
+
+    def _confirm_remove_completion(self, habit_data, date_to_remove, popup_instance):
+        popup_instance.dismiss()
+        if date_to_remove in habit_data.get('completed_dates', []):
+            habit_data['completed_dates'].remove(date_to_remove)
+            # If after removal, completed_dates becomes empty and it's not the start date,
+            # we might consider deleting this "instance" of the habit.
+            # For now, just save.
+            add_or_update_habit(habit_data)
+            self.show_info_popup("Removed", f"Completion for '{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) on {get_display_date_from_str(date_to_remove)} removed.")
+            self.refresh()
+        else:
+            self.show_info_popup("Error", "Date not found in completed list.")
+
+
+    # Logic for marking specific date from HabitDisplayScreen
+    def show_mark_specific_date_popup(self, habit_data, parent_popup_instance):
+        parent_popup_instance.dismiss()
+
+        popup_content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        
+        popup_content.add_widget(Label(text=f"Mark '{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) for Date", font_size=sp(20), bold=True, color=(0,0,0,1), size_hint_y=None, height=dp(40)))
+
+        self.temp_selected_date_for_marking = datetime.now().date()
+        self.temp_date_button = Button(
+            text=f"Selected Date: {self.temp_selected_date_for_marking.strftime('%Y-%m-%d')}",
+            font_size=sp(18),
+            size_hint_y=None, height=dp(50),
+            background_color=(0.6, 0.8, 1, 1),
+            color=(0,0,0,1)
+        )
+        self.temp_date_button.bind(on_press=lambda x: self._show_calendar_for_marking_popup(habit_data))
+        popup_content.add_widget(self.temp_date_button)
+
+        action_buttons_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(60), spacing=dp(10))
+        
+        mark_done_btn = Button(text='Mark Done', font_size=sp(18), background_color=(0, 0.7, 0, 1), color=(1, 1, 1, 1))
+        mark_done_btn.bind(on_press=lambda x: self._mark_habit_for_specific_date(habit_data, True, self.mark_date_popup))
+        action_buttons_layout.add_widget(mark_done_btn)
+
+        mark_not_done_btn = Button(text='Mark Not Done', font_size=sp(18), background_color=(0.7, 0, 0, 1), color=(1, 1, 1, 1))
+        mark_not_done_btn.bind(on_press=lambda x: self._mark_habit_for_specific_date(habit_data, False, self.mark_date_popup))
+        action_buttons_layout.add_widget(mark_not_done_btn)
+        
+        popup_content.add_widget(action_buttons_layout)
+
+        close_btn = Button(text='Cancel', size_hint_y=None, height=dp(50), background_color=(0.5,0.5,0.5,1), color=(1,1,1,1), font_size=sp(18))
+        popup_content.add_widget(close_btn)
+
+        self.mark_date_popup = Popup(title=f"Mark '{capitalize_first_letter(habit_data['name'])}'", content=popup_content,
+                                 size_hint=(0.9, 0.8), auto_dismiss=False)
+        close_btn.bind(on_press=self.mark_date_popup.dismiss)
+        self.mark_date_popup.open()
+
+
+    def _show_calendar_for_marking_popup(self, habit_data):
+        calendar_popup_content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        
+        nav_layout = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(10))
+        self._calendar_current_month = self.temp_selected_date_for_marking.month
+        self._calendar_current_year = self.temp_selected_date_for_marking.year
+
+        prev_month_btn = Button(text='< Prev', size_hint_x=0.25, background_color=(0.3,0.3,0.3,1), color=(1,1,1,1))
+        prev_month_btn.bind(on_press=self._go_prev_month_calendar)
+        nav_layout.add_widget(prev_month_btn)
+
+        self.calendar_month_year_label = Label(text=f'{calendar.month_name[self._calendar_current_month]} {self._calendar_current_year}',
+                                      font_size=sp(20), size_hint_x=0.5, color=(0,0,0,1))
+        nav_layout.add_widget(self.calendar_month_year_label)
+
+        next_month_btn = Button(text='Next >', size_hint_x=0.25, background_color=(0.3,0.3,0.3,1), color=(1,1,1,1))
+        next_month_btn.bind(on_press=self._go_next_month_calendar)
+        nav_layout.add_widget(next_month_btn)
+        calendar_popup_content.add_widget(nav_layout)
+
+        day_names_layout = BoxLayout(size_hint_y=None, height=dp(30))
+        day_names = [calendar.day_abbr[i] for i in [0, 1, 2, 3, 4, 5, 6]] # Mon, Tue, ... Sun
+        for day_name in day_names:
+            day_names_layout.add_widget(Label(text=day_name, bold=True, color=(0,0,0,1), font_size=sp(14)))
+        calendar_popup_content.add_widget(day_names_layout)
+
+        self._current_calendar_grid = GridLayout(cols=7, spacing=dp(2), size_hint_y=None, height=dp(250))
+        calendar_popup_content.add_widget(self._current_calendar_grid)
+        
+        self._update_calendar_grid_for_marking()
+        
+        close_btn = Button(text='Select & Close', size_hint_y=None, height=dp(50), background_color=(0.5,0.5,0.5,1), color=(1,1,1,1), font_size=sp(18))
+        calendar_popup_content.add_widget(close_btn)
+
+        self._calendar_picker_popup = Popup(title='Select Date', content=calendar_popup_content,
+                                 size_hint=(0.9, 0.8), auto_dismiss=False)
+        close_btn.bind(on_press=self._calendar_picker_popup.dismiss)
+        self._calendar_picker_popup.open()
+
+    def _update_calendar_grid_for_marking(self):
+        self._current_calendar_grid.clear_widgets()
+        cal = calendar.Calendar(firstweekday=calendar.MONDAY)
+
+        month_days = cal.monthdayscalendar(self._calendar_current_year, self._calendar_current_month)
+
+        for week in month_days:
+            for day in week:
+                if day == 0:
+                    self._current_calendar_grid.add_widget(Label(text='', color=(0,0,0,1)))
+                else:
+                    day_btn = Button(text=str(day), size_hint_y=None, height=dp(35), font_size=sp(16))
+                    if self.temp_selected_date_for_marking.day == day and \
+                       self.temp_selected_date_for_marking.month == self._calendar_current_month and \
+                       self.temp_selected_date_for_marking.year == self._calendar_current_year:
+                        day_btn.background_color = get_color_from_hex('#4CAF50')
+                        day_btn.color = (1,1,1,1)
+                    else:
+                        day_btn.background_color = (0.9,0.9,0.9,1)
+                        day_btn.color = (0,0,0,1)
+                        
+                    day_btn.bind(on_press=self._select_date_from_marking_calendar)
+                    day_btn.date_val = day
+                    self._current_calendar_grid.add_widget(day_btn)
+        
+        self.calendar_month_year_label.text = f'{calendar.month_name[self._calendar_current_month]} {self._calendar_current_year}'
+
+    def _go_prev_month_calendar(self, instance):
+        self._calendar_current_month -= 1
+        if self._calendar_current_month < 1:
+            self._calendar_current_month = 12
+            self._calendar_current_year -= 1
+        self._update_calendar_grid_for_marking()
+
+    def _go_next_month_calendar(self, instance):
+        self._calendar_current_month += 1
+        if self._calendar_current_month > 12:
+            self._calendar_current_month = 1
+            self._calendar_current_year += 1
+        self._update_calendar_grid_for_marking()
+
+    def _select_date_from_marking_calendar(self, instance):
+        self.temp_selected_date_for_marking = datetime(self._calendar_current_year, self._calendar_current_month, instance.date_val).date()
+        self.temp_date_button.text = f"Selected Date: {self.temp_selected_date_for_marking.strftime('%Y-%m-%d')}"
+        self._calendar_picker_popup.dismiss()
+
+    def _mark_habit_for_specific_date(self, habit_data, is_done, parent_popup_instance):
+        parent_popup_instance.dismiss()
+        selected_date_str = self.temp_selected_date_for_marking.strftime('%Y-%m-%d')
+
+        if 'completed_dates' not in habit_data:
+            habit_data['completed_dates'] = []
+
+        if is_done:
+            if selected_date_str not in habit_data['completed_dates']:
+                habit_data['completed_dates'].append(selected_date_str)
+                habit_data['completed_dates'].sort()
+                add_or_update_habit(habit_data)
+                self.show_info_popup("Success", f"'{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) marked DONE for {selected_date_str}.")
+                Logger.info(f"HabitDisplayScreen: Marked '{habit_data['name']}' (start: {habit_data['start_date']}) done for {selected_date_str}.")
+            else:
+                self.show_info_popup("Already Done", f"'{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) already DONE for {selected_date_str}.")
+                Logger.info(f"HabitDisplayScreen: '{habit_data['name']}' (start: {habit_data['start_date']}) already marked done for {selected_date_str}.")
+        else:
+            if selected_date_str in habit_data['completed_dates']:
+                habit_data['completed_dates'].remove(selected_date_str)
+                add_or_update_habit(habit_data)
+                self.show_info_popup("Success", f"'{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) marked NOT DONE for {selected_date_str}.")
+                Logger.info(f"HabitDisplayScreen: '{habit_data['name']}' (start: {habit_data['start_date']}) not done for {selected_date_str}.")
+            else:
+                self.show_info_popup("Not Done", f"'{capitalize_first_letter(habit_data['name'])}' (Start: {get_display_date_from_str(habit_data['start_date'])}) was not DONE for {selected_date_str}.")
+                Logger.info(f"HabitDisplayScreen: '{habit_data['name']}' (start: {habit_data['start_date']}) was not marked done for {selected_date_str}.")
+        
+        self.refresh()
+
+
+    def _show_delete_confirmation_from_popup(self, habit_to_delete, parent_popup_instance):
+        parent_popup_instance.dismiss()
+
+        content = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(10))
+        content.add_widget(Label(text=f"Are you sure you want to delete this habit entry: '{capitalize_first_letter(habit_to_delete['name'])}' (Start: {get_display_date_from_str(habit_to_delete['start_date'])})?",
+                                 font_size=sp(18), halign='center', valign='middle', size_hint_y=None, height=dp(70)))
+        
+        button_layout = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
+        yes_button = Button(text='Yes', font_size=sp(18), background_color=get_color_from_hex('#28A745'), color=get_color_from_hex('#FFFFFF'))
+        no_button = Button(text='No', font_size=sp(18), background_color=get_color_from_hex('#DC3545'), color=get_color_from_hex('#FFFFFF'))
+        
+        button_layout.add_widget(yes_button)
+        button_layout.add_widget(no_button)
+        content.add_widget(button_layout)
+
+        confirm_popup = Popup(title='Confirm Deletion', content=content,
+                      size_hint=(0.8, 0.4), auto_dismiss=False)
+        
+        yes_button.bind(on_press=lambda x: self._confirm_delete(habit_to_delete, confirm_popup))
+        no_button.bind(on_press=confirm_popup.dismiss)
+
+        confirm_popup.open()
+
+
+    def _confirm_delete(self, habit_to_delete, popup_instance):
+        popup_instance.dismiss()
+        self.delete_habit(habit_to_delete)
+
+    # MODIFIED: Delete habit now considers name AND start_date for uniqueness
+    def delete_habit(self, habit_to_delete):
+        Logger.info(f"HabitDisplayScreen: Attempting to delete habit entry: '{habit_to_delete['name']}' (start: {habit_to_delete['start_date']})")
+        all_habits = load_habits_from_file()
+
+        # Delete by comparing normalized name AND start_date
+        updated_habits = [
+            habit for habit in all_habits 
+            if not (habit.get("name", "").strip().lower() == habit_to_delete.get("name", "").strip().lower() and
+                    habit.get("start_date") == habit_to_delete.get("start_date"))
+        ]
+        
+        if len(updated_habits) < len(all_habits):
+            Logger.info(f"HabitDisplayScreen: Successfully removed habit entry '{habit_to_delete['name']}' (start: {habit_to_delete['start_date']}) from list.")
+            save_all_habits_to_file(updated_habits)
+            self.refresh()
+        else:
+            Logger.warning(f"HabitDisplayScreen: Habit entry '{habit_to_delete['name']}' (start: {habit_to_delete['start_date']}) not found in list for deletion.")
+
+    def go_to_edit_habit(self, habit_data, popup_instance):
+        popup_instance.dismiss()
+        if 'input' in self.manager.screen_names:
+            # When editing, we need to pass the specific habit instance
+            self.manager.get_screen('input').set_habit_for_edit(habit_data)
+            # Also set the mode for bad habits so spinner is used
+            self.manager.get_screen('input').set_mode_bad_habit_selection(True) 
+        self.manager.current = 'input'
+
+
+    def go_back_to_main(self, instance):
+        Logger.info("HabitDisplayScreen: Going back to Main screen.")
+        self.manager.current = 'main'
+
+    def reset_habits_and_refresh(self, instance):
+        Logger.info("HabitDisplayScreen: Resetting habits and refreshing display with delay.")
+        reset_habits()
+        Clock.schedule_once(lambda dt: self.refresh(), 0.1)
+
+# New Analysis Screen
+class AnalysisScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root_layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(10))
+        self.add_widget(self.root_layout)
+
+        # UPDATED: Title to reflect "Total Completions"
+        title = Label(text='Habit Analysis (Total Completions)', font_size=sp(28), bold=True, color=(0, 0, 0, 1), size_hint_y=None, height=dp(50))
+        self.root_layout.add_widget(title)
+
+        # Header for the analysis table
+        header_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(50), padding=(dp(10), dp(10)), spacing=dp(5))
+        with header_layout.canvas.before:
+            Color(*get_color_from_hex('#6200EE')) # A nice deep purple for headers
+            self.header_rect = Rectangle(pos=header_layout.pos, size=header_layout.size)
+        header_layout.bind(pos=self._update_rect, size=self._update_rect)
+
+        self.header_name_label = Label(text='Habit Name (Start Date)', font_size=sp(16), bold=True, color=get_color_from_hex('#FFFFFF'), size_hint_x=0.6, halign='left', valign='middle')
+        # UPDATED: Header for "Total Completions"
+        self.header_progress_label = Label(text='Total Completions', font_size=sp(16), bold=True, color=get_color_from_hex('#FFFFFF'), size_hint_x=0.4, halign='center', valign='middle')
+
+        # Ensure text fits by binding text_size to width
+        self.header_name_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+        self.header_progress_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+        
+        header_layout.add_widget(self.header_name_label)
+        header_layout.add_widget(self.header_progress_label)
+        self.root_layout.add_widget(header_layout)
+
+        self.scroll_view = ScrollView(size_hint=(1, 1))
+        self.root_layout.add_widget(self.scroll_view)
+
+        self.analysis_list_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(2), padding=dp(5))
+        self.analysis_list_layout.bind(minimum_height=self.analysis_list_layout.setter('height'))
+        self.scroll_view.add_widget(self.analysis_list_layout)
+
+        # Back to Main button
+        back_to_main_btn = Button(text='Main Menu', font_size=sp(20), size_hint_y=None, height=dp(60), background_color=get_color_from_hex('#4CAF50'), color=get_color_from_hex('#FFFFFF'))
+        back_to_main_btn.bind(on_press=self.go_back_to_main)
+        self.root_layout.add_widget(back_to_main_btn)
+
+    def _update_rect(self, instance, value):
+        self.header_rect.pos = instance.pos
+        self.header_rect.size = instance.size
+
+    def _update_row_rects(self, instance, value):
+        if hasattr(instance, '_outer_rect'):
+            instance._outer_rect.pos = instance.pos
+            instance._outer_rect.size = instance.size
+        if hasattr(instance, '_inner_rect'):
+            instance._inner_rect.pos = (instance.pos[0] + dp(1), instance.pos[1] + dp(1))
+            instance._inner_rect.size = (instance.size[0] - dp(2), instance.size[1] - dp(2))
+
+    def on_pre_enter(self, *args):
+        self.refresh_analysis()
+
+    def refresh_analysis(self):
+        Logger.info("AnalysisScreen: Refreshing habit analysis.")
+        self.analysis_list_layout.clear_widgets()
+        habits = load_habits_from_file()
+
+        if not habits:
+            Logger.info("AnalysisScreen: No habits found for analysis.")
+            no_habits_label = Label(text='No habits to analyze. Add some habits first!',
+                                    color=get_color_from_hex('#424242'), font_size=sp(16),
+                                    size_hint_y=None, height=dp(50))
+            self.analysis_list_layout.add_widget(no_habits_label)
+        else:
+            # Sort habits for consistent display in analysis
+            display_habits = sorted(habits, key=lambda x: (x.get('name', '').lower(), x.get('start_date')), reverse=True)
+
+
+            for i, habit in enumerate(display_habits):
+                row_bg_color = get_color_from_hex('#FFFFFF') if i % 2 == 0 else get_color_from_hex('#F0F0F0')
+
+                habit_analysis_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(50), padding=(dp(5), dp(5)), spacing=dp(5))
+                with habit_analysis_row.canvas.before:
+                    Color(*get_color_from_hex('#B0B0B0')) # Border color
+                    habit_analysis_row._outer_rect = Rectangle(pos=habit_analysis_row.pos, size=habit_analysis_row.size)
+                    Color(*row_bg_color) # Inner background
+                    habit_analysis_row._inner_rect = Rectangle(pos=habit_analysis_row.pos, size=habit_analysis_row.size)
+                habit_analysis_row.bind(pos=self._update_row_rects, size=self._update_row_rects)
+
+                # Ensure habit name is capitalized and include start date for display
+                name_label = Label(text=f"{capitalize_first_letter(habit['name'])} (Start: {get_display_date_from_str(habit['start_date'])})",
+                                   color=get_color_from_hex('#000000'), font_size=sp(14),
+                                   halign='left', valign='middle', size_hint_x=0.6)
+                
+                # UPDATED: Get and display total distinct completed count
+                total_completions = get_habit_total_completed_count(habit)
+                progress_text = f"{total_completions}" # Just the total count
+                progress_label = Label(text=progress_text,
+                                       color=get_color_from_hex('#000000'), font_size=sp(15),
+                                       halign='center', valign='middle', size_hint_x=0.4)
+
+                name_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+                progress_label.bind(width=lambda i, w: setattr(i, 'text_size', (w - dp(10), None)))
+
+                habit_analysis_row.add_widget(name_label)
+                habit_analysis_row.add_widget(progress_label)
+                self.analysis_list_layout.add_widget(habit_analysis_row)
+
+    def go_back_to_main(self, instance):
+        Logger.info("AnalysisScreen: Going back to Main screen.")
+        self.manager.current = 'main'
+
+# New Prayer Screen
+class PrayerScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        layout = BoxLayout(orientation='vertical', padding=dp(30), spacing=dp(20))
+        
+        # Professional-looking title
+        title = Label(text='A Prayer for Inner Strength', 
+                      font_size=sp(20), bold=True, 
+                      color=get_color_from_hex('#3F51B5'), # Deep blue for title
+                      size_hint_y=None, height=dp(60))
+        layout.add_widget(title)
+
+        # Prayer text - using ScrollView for potentially long text
+        scroll_view = ScrollView(size_hint=(1, 1))
+        prayer_text_label = Label(
+            text="""
+   Dear Lord,
+
+ Grant me the strength and courage to overcome my weaknesses and abandon bad habits that hinder my growth.
+    Fill my heart with your divine light, guiding me towards righteousness and compassion.
+   Help me become a better person, a beacon of kindness and virtue in this world.
+ May your grace empower me to make choices that align with your will, and may I always walk the path of goodness.
+      I seek your guidance in every step, trusting in your infinite wisdom and love.
+
+            Amen.
+            """,
+            font_size=sp(14),
+            color=get_color_from_hex('#212121'), # Dark gray for text
+            halign='center',
+            valign='top',
+            text_size=(Window.width - dp(60), None), # Adjust text_size to window width with padding
+            size_hint_y=None
+        )
+        prayer_text_label.bind(texture_size=prayer_text_label.setter('size')) # Ensure label expands with text
+        scroll_view.add_widget(prayer_text_label)
+        layout.add_widget(scroll_view)
+
+        # Back button
+        back_btn = Button(text='Back to Main', font_size=sp(22), size_hint_y=None, height=dp(60), 
+                          background_color=get_color_from_hex('#FF5722'), # Orange for back button
+                          color=get_color_from_hex('#FFFFFF'))
+        back_btn.bind(on_press=self.go_back)
+        layout.add_widget(back_btn)
+
+        self.add_widget(layout)
+
+    def go_back(self, instance):
+        self.manager.current = 'main'
+
+
+# Main application class
+class HabitApp(App):
+    def build(self):
+        try:
+            user_data_dir = self.user_data_dir
+            if not os.path.exists(user_data_dir):
+                os.makedirs(user_data_dir)
+            Logger.info(f"HabitApp: Using user_data_dir: {user_data_dir}")
+        except Exception as e:
+            user_data_dir = os.path.dirname(os.path.abspath(__file__))
+            Logger.warning(f"HabitApp: Could not use user_data_dir, falling back to app directory. Error: {e}")
+        
+        self.save_file_path = os.path.join(user_data_dir, 'habits.json')
+        Logger.info(f"HabitApp: Save file path set to: {self.save_file_path}")
+
+        sm = ScreenManager()
+        sm.add_widget(MainScreen(name='main'))
+        sm.add_widget(InputScreen(name='input')) 
+        sm.add_widget(HabitDisplayScreen(name='habit_display'))
+        sm.add_widget(AnalysisScreen(name='analysis_screen')) # Add the new Analysis Screen
+        sm.add_widget(PrayerScreen(name='prayer_screen')) # Add the new Prayer Screen
+        return sm
+
+# Run the application
+if __name__ == '__main__':
+    HabitApp().run()
